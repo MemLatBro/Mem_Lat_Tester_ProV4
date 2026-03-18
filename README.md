@@ -1,4 +1,5 @@
 # Mem_Lat_Tester_ProV4
+Copy the Code file and save as a .py file and run it.
 Intro: This is an indepth memory latency grapher for RAM over clockers as well as a mild stress test! 
 
 This is meant to be an In depth memory latency grapher it will produce 3 files an HTML file that will open in browser
