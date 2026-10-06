@@ -32,6 +32,7 @@ Usage:
     python memlat_pro.py --compare a.json b.json   # diff two runs 
     python memlat_pro.py --no-menu --bandwidth     # CLI only, add bandwidth
     python memlat_pro.py --no-menu --rfo           # CLI only, add cross-core RFO test
+    python memlat_pro.py --hugepage-check          # large-page diagnostics only
 
 Changes in 6.96.0 (each checkpoint file carries VERSION "6.96.0-cpN"):
   cp1  Removed the P<->E interconnect test (it timed a single Python store,
@@ -134,6 +135,27 @@ Changes in 6.98.0:
   - Loaded latency: workers are started with "spawn" (no fork of a
     multi-threaded process), report every pass (was every third), and a worker
     that dies during start-up is detected at once instead of after 90 s.
+
+Changes in 6.98.1:
+  - Windows huge-page coverage is measured. hugepage_coverage_pct() returned a
+    hard-coded 0.0 on Windows (left over from before 6.97, when Windows never
+    requested large pages), so every Windows run printed "huge-page coverage:
+    0%" even when VirtualAlloc(MEM_LARGE_PAGES) had succeeded. It now reads
+    the LargePage and Valid bits of every 4 KB page of the buffer with
+    QueryWorkingSetEx.
+  - Every "2 MB" buffer is verified after it is written (loaded latency
+    buffer, page-modes 2 MB run, tlb_2m_chase): Windows needs >= 99% coverage,
+    Linux >= 90% (THP). Below that, the loaded latency test falls back to 4 KB
+    pages with the reason, and every result line, the JSON and the HTML are
+    labelled "4 KB fallback"; the sweep's 2 MB entries are marked unavailable.
+  - Failure reasons are specific: SeLockMemoryPrivilege missing from the token
+    (with the UAC elevation type, so a non-elevated administrator is told to
+    elevate), AdjustTokenPrivileges error 1300, the VirtualAlloc error code
+    and name (e.g. 1450 ERROR_NO_SYSTEM_RESOURCES), or the measured coverage.
+  - New --hugepage-check: reports elevation, SeLockMemoryPrivilege state
+    before/after enabling, GetLargePageMinimum(), then allocates 64 MB and
+    2 GB on large pages and reads back their coverage, with a 4 KB control
+    buffer that must read 0%. Needs NumPy only (no Numba).
 """
  
 # ══════════════════════════════════════════════════════════════════════════════
@@ -200,7 +222,7 @@ QUICK_MAX_MB          = 256
 QUICK_TRAVERSAL_SCALE = 0.70
 DEFAULT_RNG_SEED      = 42
  
-VERSION = "6.98.0"
+VERSION = "6.98.1"
 
 
 def _pause(prompt: str = "\n  Press Enter to exit...") -> None:
@@ -806,24 +828,75 @@ def memory_page_context() -> Dict:
         ctx["allocation"] = (f"one anonymous mapping per buffer; MADV_HUGEPAGE when "
                              f">= {HUGEPAGE_ADVISE_MIN_BYTES >> 20} MiB (same as NumPy)")
     elif sys.platform == "win32":
-        ctx["allocation"] = "one anonymous mapping per buffer; standard pages (large pages not requested)"
+        ctx["allocation"] = ("one anonymous mapping per buffer on 4 KB pages; buffers that need "
+                             "2 MB pages use VirtualAlloc(MEM_LARGE_PAGES)")
+        ctx["coverage_method"] = "QueryWorkingSetEx, LargePage+Valid bits of every 4 KB page"
     else:
         ctx["allocation"] = "one anonymous mapping per buffer; OS default pages"
     return ctx
 
 
+_WS_VALID = 1 << 0          # PSAPI_WORKING_SET_EX_BLOCK.Valid
+_WS_LARGE_PAGE = 1 << 23    # PSAPI_WORKING_SET_EX_BLOCK.LargePage (only meaningful when Valid)
+
+
+def _win_ws_coverage(addr: int, nbytes: int) -> Dict[str, Any]:
+    """
+    (6.98.1) QueryWorkingSetEx over [addr, addr + nbytes), one entry per 4 KB
+    page. Returns {"pages", "valid", "large", "valid_pct", "large_pct"}.
+    large counts pages with both Valid and LargePage set: when Valid is 0 the
+    other bits belong to the "Invalid" layout and bit 23 means nothing.
+    Raises OSError (with the Win32 error code) when the call fails.
+    """
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    try:
+        query = kernel32.K32QueryWorkingSetEx
+    except AttributeError:                       # Windows before 7: psapi.dll only
+        query = ctypes.WinDLL("psapi", use_last_error=True).QueryWorkingSetEx
+    query.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+    query.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    proc = kernel32.GetCurrentProcess()
+    page = 4096
+    n_pages = max(1, (int(nbytes) + page - 1) // page)
+    chunk = 1 << 16                              # 64 Ki entries = 1 MiB per call
+    # PSAPI_WORKING_SET_EX_INFORMATION = {PVOID VirtualAddress; ULONG_PTR VirtualAttributes}
+    info = np.zeros((min(chunk, n_pages), 2), dtype=np.uintp)
+    valid = large = 0
+    for start in range(0, n_pages, chunk):
+        k = min(chunk, n_pages - start)
+        info[:k, 0] = int(addr) + (start + np.arange(k, dtype=np.uintp)) * page
+        info[:k, 1] = 0
+        if not query(proc, info.ctypes.data, k * info.itemsize * 2):
+            err = ctypes.get_last_error()
+            raise OSError(err, f"QueryWorkingSetEx failed (error {err})")
+        attrs = info[:k, 1]
+        v = (attrs & np.uintp(_WS_VALID)) != 0
+        valid += int(np.count_nonzero(v))
+        large += int(np.count_nonzero(v & ((attrs & np.uintp(_WS_LARGE_PAGE)) != 0)))
+    return {"pages": n_pages, "valid": valid, "large": large,
+            "valid_pct": round(valid * 100.0 / n_pages, 1),
+            "large_pct": round(large * 100.0 / n_pages, 1)}
+
+
 def hugepage_coverage_pct(arr: np.ndarray) -> Optional[float]:
     """
-    Percent of `arr` backed by transparent huge pages, summed from the
-    AnonHugePages fields of the mapping(s) covering it in /proc/self/smaps.
-    Linux only; 0.0 on Windows (large pages are never requested), None when
-    it cannot be attributed (e.g. the buffer shares a mapping with other data,
-    as NumPy-allocated arrays do). Call after the buffer has been written:
-    pages are only allocated on first touch.
+    Percent of `arr` backed by 2 MB pages.
+    Linux: summed from the AnonHugePages fields of the mapping(s) covering it
+    in /proc/self/smaps; None when it cannot be attributed (e.g. the buffer
+    shares a mapping with other data, as NumPy-allocated arrays do).
+    Windows (6.98.1): measured with QueryWorkingSetEx, per 4 KB page; it was a
+    hard-coded 0.0 before. None when the query fails.
+    Call after the buffer has been written: pages are only allocated on first
+    touch (Windows large pages are committed by VirtualAlloc itself).
     """
     nbytes = int(arr.nbytes)
     if sys.platform == "win32":
-        return 0.0
+        try:
+            return _win_ws_coverage(int(arr.ctypes.data), nbytes)["large_pct"]
+        except Exception:
+            return None
     if not sys.platform.startswith("linux"):
         return None
     if nbytes < (2 << 20):
@@ -949,6 +1022,9 @@ import weakref
 
 PAGE_MODE_FALLBACK_BYTES = 256 << 20   # fallback headline working set
 LINUX_2M_MIN_COVERAGE_PCT = 90.0       # below this a "2 MB" buffer is not trusted
+# (6.98.1) MEM_LARGE_PAGES is all-or-nothing, so anything short of ~100% on
+# Windows means the readback or the allocation is wrong.
+WIN_2M_MIN_COVERAGE_PCT = 99.0
 
 
 class LargePageUnavailable(Exception):
@@ -966,13 +1042,103 @@ _WIN_LP_HINT_PRIV = ("Grant 'Lock pages in memory' to your account: secpol.msc -
 _WIN_LP_HINT_FRAG = ("Windows could not find enough physically contiguous 2 MB blocks "
                      "(memory fragmentation). Run soon after a reboot, or close "
                      "memory-heavy applications, and try again.")
+_WIN_LP_HINT_ELEVATE = ("Your account is an administrator, and UAC removes 'Lock pages in "
+                        "memory' from non-elevated processes. Run MemLat from an elevated "
+                        "terminal (right-click -> Run as administrator).")
+_WIN_LP_HINT_CHECK = "Run with --hugepage-check for a step-by-step large-page diagnosis."
+
+# (6.98.1) Win32 error codes that large-page allocation can return, by name
+_WIN_ERROR_NAMES = {
+    8: "ERROR_NOT_ENOUGH_MEMORY",
+    87: "ERROR_INVALID_PARAMETER",
+    1300: "ERROR_NOT_ALL_ASSIGNED",
+    1314: "ERROR_PRIVILEGE_NOT_HELD",
+    1450: "ERROR_NO_SYSTEM_RESOURCES",
+    1454: "ERROR_PAGEFILE_QUOTA",
+    1455: "ERROR_COMMITMENT_LIMIT",
+}
 
 
-def _win_is_elevated() -> Optional[bool]:
+def _win_err(code: int) -> str:
+    """'1450 ERROR_NO_SYSTEM_RESOURCES'"""
+    name = _WIN_ERROR_NAMES.get(int(code))
+    return f"{code} {name}" if name else str(code)
+
+
+def _win_token_info() -> Dict[str, Any]:
+    """
+    (6.98.1) What this process's token says about large pages:
+      elevated              True / False (TokenElevation)
+      elevation_type        "default" (no split token: UAC off, or not an admin),
+                            "full" (elevated admin), "limited" (admin, NOT elevated:
+                            UAC filtered token, which drops SeLockMemoryPrivilege)
+      lock_memory_privilege "enabled" / "present, disabled" / "absent"
+    Any value is None when it cannot be read; "error" says why.
+    """
+    from ctypes import wintypes
+    out: Dict[str, Any] = {"elevated": None, "elevation_type": None,
+                           "lock_memory_privilege": None, "error": None}
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # Fixed-width fields: DWORD/LONG are 32-bit on Windows (wintypes maps them
+    # to c_ulong/c_long, which are 64-bit elsewhere and would break the layout).
+    DWORD32 = ctypes.c_uint32
+
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", DWORD32), ("HighPart", ctypes.c_int32)]
+
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", DWORD32)]
+
+    TOKEN_QUERY = 0x8
+    TokenPrivileges, TokenElevationType, TokenElevation = 3, 18, 20
+    SE_PRIVILEGE_ENABLED = 0x2
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                             DWORD32, ctypes.POINTER(DWORD32)]
+    advapi32.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                               ctypes.POINTER(LUID)]
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY,
+                                     ctypes.byref(token)):
+        out["error"] = f"OpenProcessToken failed (error {ctypes.get_last_error()})"
+        return out
     try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return None
+        ret = DWORD32()
+        val = DWORD32()
+        if advapi32.GetTokenInformation(token, TokenElevation, ctypes.byref(val),
+                                        ctypes.sizeof(val), ctypes.byref(ret)):
+            out["elevated"] = bool(val.value)
+        if advapi32.GetTokenInformation(token, TokenElevationType, ctypes.byref(val),
+                                        ctypes.sizeof(val), ctypes.byref(ret)):
+            out["elevation_type"] = {1: "default", 2: "full", 3: "limited"}.get(val.value)
+        luid = LUID()
+        if not advapi32.LookupPrivilegeValueW(None, "SeLockMemoryPrivilege", ctypes.byref(luid)):
+            out["error"] = f"LookupPrivilegeValue failed (error {ctypes.get_last_error()})"
+            return out
+        need = DWORD32()
+        advapi32.GetTokenInformation(token, TokenPrivileges, None, 0, ctypes.byref(need))
+        buf = ctypes.create_string_buffer(max(int(need.value), 4))
+        if not advapi32.GetTokenInformation(token, TokenPrivileges, buf, len(buf),
+                                            ctypes.byref(need)):
+            out["error"] = f"GetTokenInformation(TokenPrivileges) failed (error {ctypes.get_last_error()})"
+            return out
+        # TOKEN_PRIVILEGES: DWORD PrivilegeCount, then LUID_AND_ATTRIBUTES[] (pack 4)
+        count = DWORD32.from_buffer(buf).value
+        privs = (LUID_AND_ATTRIBUTES * count).from_buffer(buf, ctypes.sizeof(DWORD32))
+        out["lock_memory_privilege"] = "absent"
+        for p in privs:
+            if p.Luid.LowPart == luid.LowPart and p.Luid.HighPart == luid.HighPart:
+                out["lock_memory_privilege"] = ("enabled" if p.Attributes & SE_PRIVILEGE_ENABLED
+                                                else "present, disabled")
+                break
+        return out
+    finally:
+        kernel32.CloseHandle(token)
 
 
 def _win_enable_lock_memory_privilege() -> Tuple[bool, str]:
@@ -1032,10 +1198,21 @@ def _win_alloc_large_i64(n_elems: int) -> Tuple[np.ndarray, Dict]:
     ok, why = _win_enable_lock_memory_privilege()
     if not ok:
         if why == "not_held":
-            elev = _win_is_elevated()
-            reason = ("'Lock pages in memory' privilege not held"
-                      + ("" if elev else " (process not elevated)" if elev is False else ""))
-            raise LargePageUnavailable(reason, _WIN_LP_HINT_PRIV)
+            # (6.98.1) Say which of the two causes it is: the token of a
+            # non-elevated administrator never carries the privilege (UAC
+            # filtered token); otherwise the account does not hold it yet.
+            try:
+                tok = _win_token_info()
+            except Exception:
+                tok = {}
+            base = ("SeLockMemoryPrivilege is not in this process's token "
+                    "(AdjustTokenPrivileges: error 1300 ERROR_NOT_ALL_ASSIGNED)")
+            if tok.get("elevation_type") == "limited":
+                raise LargePageUnavailable(base + "; administrator account, process not elevated",
+                                           _WIN_LP_HINT_ELEVATE)
+            raise LargePageUnavailable(
+                base + (f"; elevation type: {tok['elevation_type']}" if tok.get("elevation_type") else ""),
+                _WIN_LP_HINT_PRIV)
         raise LargePageUnavailable(why, _WIN_LP_HINT_PRIV)
     from ctypes import wintypes
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1055,14 +1232,14 @@ def _win_alloc_large_i64(n_elems: int) -> Tuple[np.ndarray, Dict]:
                                  PAGE_READWRITE)
     if not addr:
         err = ctypes.get_last_error()
+        what = f"VirtualAlloc(MEM_LARGE_PAGES, {size >> 20} MB) failed: error {_win_err(err)}"
         if err == 1314:      # ERROR_PRIVILEGE_NOT_HELD
-            raise LargePageUnavailable("'Lock pages in memory' privilege not effective",
+            raise LargePageUnavailable(what + " ('Lock pages in memory' not effective)",
                                        _WIN_LP_HINT_PRIV)
-        if err in (1450, 8, 1455):   # NO_SYSTEM_RESOURCES / NOT_ENOUGH_MEMORY / PAGEFILE_QUOTA
-            raise LargePageUnavailable(f"no contiguous memory for {size >> 20} MB of large "
-                                       f"pages (error {err})", _WIN_LP_HINT_FRAG)
-        raise LargePageUnavailable(f"VirtualAlloc(MEM_LARGE_PAGES) failed (error {err})",
-                                   _WIN_LP_HINT_FRAG)
+        if err in (1450, 8, 1454, 1455):   # NO_SYSTEM_RESOURCES / NOT_ENOUGH_MEMORY / PAGEFILE_QUOTA / COMMITMENT_LIMIT
+            raise LargePageUnavailable(what + " (no contiguous memory for the large pages)",
+                                       _WIN_LP_HINT_FRAG)
+        raise LargePageUnavailable(what, _WIN_LP_HINT_CHECK)
     arr = np.ctypeslib.as_array((ctypes.c_int64 * int(n_elems)).from_address(addr))
     # VirtualAlloc memory is zero-filled; release it when the array is freed.
     weakref.finalize(arr, kernel32.VirtualFree, addr, 0, MEM_RELEASE)
@@ -1100,6 +1277,38 @@ def make_page_allocator(mode: str):
                     "echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled")
         return lambda n: _linux_alloc_i64(n, huge=(mode == "2m"))
     raise LargePageUnavailable(f"page-size control not implemented on {sys.platform}")
+
+
+def min_2m_coverage_pct() -> float:
+    """Coverage a '2 MB' buffer needs before it is reported as 2 MB pages."""
+    return WIN_2M_MIN_COVERAGE_PCT if sys.platform == "win32" else LINUX_2M_MIN_COVERAGE_PCT
+
+
+def verify_2m_coverage(buf: np.ndarray) -> float:
+    """
+    (6.98.1) Read back how much of a buffer from make_page_allocator("2m") is
+    really on 2 MB pages (QueryWorkingSetEx on Windows, smaps on Linux) and
+    raise LargePageUnavailable below min_2m_coverage_pct(). Before 6.98.1 only
+    Linux was checked; a Windows "2 MB" buffer was trusted on the strength of
+    VirtualAlloc returning an address. Call after the buffer has been written.
+    """
+    need = min_2m_coverage_pct()
+    if sys.platform == "win32":
+        try:
+            cov: Optional[float] = _win_ws_coverage(int(buf.ctypes.data), int(buf.nbytes))["large_pct"]
+        except Exception as e:
+            raise LargePageUnavailable(f"2 MB-page coverage could not be measured: {e}",
+                                       _WIN_LP_HINT_CHECK)
+        hint = _WIN_LP_HINT_CHECK
+    else:
+        cov = hugepage_coverage_pct(buf)
+        hint = ("Memory is fragmented. Run soon after boot, or: "
+                "echo 1 | sudo tee /proc/sys/vm/compact_memory")
+    if cov is None or cov < need:
+        raise LargePageUnavailable(
+            f"only {cov if cov is not None else '?'}% of the buffer got 2 MB pages "
+            f"(need >= {need:.0f}%)", hint)
+    return cov
 
 
 def sweep_uses_small_pages(platform_str: Optional[str], pages_ctx: Optional[Dict]) -> bool:
@@ -2286,19 +2495,16 @@ def run_loaded_latency_test(
     # of the measurement; 4 KB pages add one per hop (to DRAM under load).
     page_mode = page_mode if page_mode in ("2m", "4k") else "2m"
     lat_pages: Dict[str, Any] = {"requested": page_mode, "used": None,
-                                 "fallback_reason": None, "fallback_hint": None}
+                                 "fallback_reason": None, "fallback_hint": None,
+                                 "coverage_pct": None, "result_label": None}
     lat_buf = None
     if page_mode == "2m":
         try:
             lat_buf, lat_n_nodes = build_random_chase(
                 lat_buf_bytes, 64, rng=rng, alloc=make_page_allocator("2m"))
-            if sys.platform.startswith("linux"):
-                _cov = hugepage_coverage_pct(lat_buf)
-                if _cov is None or _cov < LINUX_2M_MIN_COVERAGE_PCT:
-                    raise LargePageUnavailable(
-                        f"only {_cov if _cov is not None else '?'}% of the buffer got 2 MB pages",
-                        "Memory is fragmented. Run soon after boot, or: "
-                        "echo 1 | sudo tee /proc/sys/vm/compact_memory")
+            # (6.98.1) Read back on every OS (was Linux only): the buffer is
+            # reported as 2 MB pages only if it measurably is.
+            lat_pages["coverage_pct"] = verify_2m_coverage(lat_buf)
             lat_pages["used"] = "2m"
         except LargePageUnavailable as e:
             lat_buf = None
@@ -2312,15 +2518,38 @@ def run_loaded_latency_test(
             print("  !! On 4 KB pages each loaded hop also pays a page walk that goes")
             print("  !! to DRAM under load, so loaded latency reads roughly 2x higher")
             print("  !! than a 2 MB-page tool such as MLC.")
+            print("  !! Every result of this run is labelled [4 KB FALLBACK].")
             print("  " + "!" * 68 + "\n")
             rng = np.random.default_rng(rng_seed)          # same chain as a clean 4 KB run
+        if sys.platform == "win32":
+            # (6.98.1) token state after the attempt, for the JSON / the log
+            try:
+                lat_pages["windows_token"] = _win_token_info()
+            except Exception as e:
+                lat_pages["windows_token"] = {"error": str(e)}
     if lat_buf is None:
         lat_buf, lat_n_nodes = build_random_chase(
             lat_buf_bytes, 64, rng=rng, alloc=make_page_allocator("4k"))
         lat_pages["used"] = "4k"
-    _pg_txt = "2 MB" if lat_pages["used"] == "2m" else "4 KB"
-    print(f"  Latency buffer pages: {_pg_txt}"
-          + ("" if lat_pages["used"] == page_mode else "  (fallback; 2 MB requested)"))
+        lat_pages["coverage_pct"] = hugepage_coverage_pct(lat_buf)
+    _fallback = lat_pages["used"] != page_mode
+    lat_pages["result_label"] = ("2 MB pages" if lat_pages["used"] == "2m"
+                                 else "4 KB fallback" if _fallback else "4 KB pages")
+    _pg_tag = "  [4 KB FALLBACK]" if _fallback else ""
+    if lat_pages["used"] == "2m":
+        print(f"  Latency buffer pages: 2 MB  (verified: {lat_pages['coverage_pct']:.1f}% "
+              f"of the buffer on 2 MB pages)")
+    elif _fallback:
+        print("  Latency buffer pages: 4 KB  (FALLBACK -- 2 MB requested; "
+              "results labelled [4 KB FALLBACK])")
+    else:
+        print("  Latency buffer pages: 4 KB  (requested)")
+    _tok = lat_pages.get("windows_token")
+    if _tok:
+        print(f"  Windows token: elevated={_tok.get('elevated')} "
+              f"(type {_tok.get('elevation_type')}), "
+              f"SeLockMemoryPrivilege={_tok.get('lock_memory_privilege')}"
+              + (f"  [{_tok['error']}]" if _tok.get("error") else ""))
 
     # ── Bandwidth calibration (verify workers generate real traffic) ──
     print("  Calibrating: verifying bandwidth worker generates real DRAM traffic...")
@@ -2360,12 +2589,23 @@ def run_loaded_latency_test(
 
     # Run context (6.96): page backing of the latency buffer and the clock of
     # the (pinned) latency core, recorded in the JSON.
+    # (6.98.1) Measured on Windows too (QueryWorkingSetEx); it was a fixed 0.
     lat_buf_thp = hugepage_coverage_pct(lat_buf)
     lat_clock = measure_clock_ghz()
     lat_cpu_now = current_cpu()
     print(f"  Latency core clock: {lat_clock} GHz (cpu {lat_cpu_now})"
-          f"  |  latency buffer huge-page coverage: "
-          f"{'n/a' if lat_buf_thp is None else f'{lat_buf_thp:.0f}%'}")
+          f"  |  latency buffer 2 MB-page coverage: "
+          f"{'n/a' if lat_buf_thp is None else f'{lat_buf_thp:.1f}%'}")
+    if lat_pages["used"] == "2m" and (lat_buf_thp is None or lat_buf_thp < min_2m_coverage_pct()):
+        # Verified at build time; a drop here means the backing changed since.
+        lat_pages["result_label"] = (f"2 MB pages NOT verified (coverage "
+                                     f"{'n/a' if lat_buf_thp is None else f'{lat_buf_thp:.1f}%'} "
+                                     f"before the baseline)")
+        _pg_tag = "  [2 MB UNVERIFIED]"
+        print("\n  " + "!" * 68)
+        print(f"  !! {lat_pages['result_label']}.")
+        print("  !! Results are labelled [2 MB UNVERIFIED] and are not comparable to MLC.")
+        print("  " + "!" * 68 + "\n")
 
     # Warmup
     _chase_kernel(lat_buf, lat_n_nodes, max(1, 500_000 // lat_n_nodes))
@@ -2422,12 +2662,14 @@ def run_loaded_latency_test(
         return step
 
     # ── Step 0: Baseline (no BW threads) ──
+    if _pg_tag:
+        print(f"\n  !! Latency buffer: {lat_pages['result_label']} -- every row below is {_pg_tag.strip()}")
     print(f"\n  {'Step':<6} {'BW Thr':>7} {'Latency (ns)':>14} {'Agg BW (GB/s)':>15} {'Label'}")
     print("  " + "-" * 65)
 
     baseline = _measure_latency("baseline (unloaded)", 0, [])
     results_data.append(baseline)
-    print(f"  {0:<6} {0:>7} {baseline['latency_ns']:>14.2f} {0:>15.2f} {baseline['label']}")
+    print(f"  {0:<6} {0:>7} {baseline['latency_ns']:>14.2f} {0:>15.2f} {baseline['label']}{_pg_tag}")
 
     # ── Progressive loading ──
     active_workers: List[_BandwidthWorkerMP] = []
@@ -2476,7 +2718,7 @@ def run_loaded_latency_test(
 
             lat_str = f"{step_result['latency_ns']:>14.2f}"
             bw_str = f"{step_result['aggregate_bw_gbs']:>15.2f}"
-            print(f"  {step_idx + 1:<6} {n_active:>7} {lat_str} {bw_str} +{label}")
+            print(f"  {step_idx + 1:<6} {n_active:>7} {lat_str} {bw_str} +{label}{_pg_tag}")
 
     except KeyboardInterrupt:
         print("\n  Interrupted — stopping bandwidth threads...")
@@ -2503,8 +2745,9 @@ def run_loaded_latency_test(
     print("=" * 72)
     print(f"  L3 cache / latency buffer    : {l3_total_mb} MB / {latency_buf_mb} MB"
           f"  ({lat_coverage:.1f}% coverage)")
-    print(f"  Baseline latency (unloaded)  : {baseline_lat:.2f} ns")
-    print(f"  Worst-case latency (loaded)  : {worst_lat:.2f} ns")
+    print(f"  Latency buffer pages         : {lat_pages['result_label']}")
+    print(f"  Baseline latency (unloaded)  : {baseline_lat:.2f} ns{_pg_tag}")
+    print(f"  Worst-case latency (loaded)  : {worst_lat:.2f} ns{_pg_tag}")
     if baseline_lat > 0:
         degradation = worst_lat / baseline_lat
         print(f"  Degradation factor           : {degradation:.1f}x")
@@ -2582,6 +2825,7 @@ def run_loaded_latency_test(
             "worst_ns": worst_lat,
             "degradation_x": round(worst_lat / baseline_lat, 2) if baseline_lat > 0 else 0,
             "peak_bw_gbs": max_bw,
+            "pages": lat_pages["result_label"],      # 6.98.1: "2 MB pages" / "4 KB fallback" / ...
         },
         "run_context": {
             "version": VERSION,
@@ -2693,9 +2937,11 @@ def _plot_loaded_latency(data: Dict, output_dir: str, ts: str) -> None:
     freq_str = f" @ {freq:.2f} GHz" if freq else ""
     summary = data.get("summary", {})
     deg = summary.get("degradation_x", 0)
+    pages_lbl = summary.get("pages")          # 6.98.1
+    pages_tag = f"  [{pages_lbl.upper()}]" if pages_lbl and pages_lbl != "2 MB pages" else ""
 
     ax1.set_title(
-        f"Loaded Latency — {cpu_model}{freq_str}\n"
+        f"Loaded Latency — {cpu_model}{freq_str}{pages_tag}\n"
         f"Baseline: {summary.get('baseline_ns', 0):.1f} ns → "
         f"Worst: {summary.get('worst_ns', 0):.1f} ns "
         f"({deg:.1f}x degradation)  |  Peak BW: {summary.get('peak_bw_gbs', 0):.1f} GB/s",
@@ -2837,7 +3083,20 @@ def generate_loaded_latency_html(data: Dict, html_path: str) -> None:
     _lp_req = {"2m": "2 MB", "4k": "4 KB"}.get(_lp.get("requested"))
     pages_line = (f"Latency buffer pages: {_lp_used}"
                   + (f" (fallback; {_lp_req} requested)" if _lp_req and _lp.get("used") != _lp.get("requested") else ""))
+    # (6.98.1) measured 2 MB-page coverage and the label every result carries
+    _lp_cov = _lp.get("coverage_pct")
+    if isinstance(_lp_cov, (int, float)):
+        pages_line += f" &middot; 2 MB-page coverage {_lp_cov:.1f}%"
+    _lp_label = _lp.get("result_label")
+    if _lp_label and _lp_label not in ("2 MB pages", "4 KB pages"):
+        pages_line += f" &middot; <strong>{_lp_label.upper()}</strong>"
+    _lp_stat_tag = (f" &middot; {_lp_label.upper()}"
+                    if _lp_label and _lp_label not in ("2 MB pages", "4 KB pages") else "")
     pages_banner = ""
+    if _lp_label and "NOT verified" in _lp_label:
+        pages_banner = ("<div class='knee-callout'><div class='title'>2 MB pages not verified</div>"
+                        f"<div class='desc'>{_lp_label}. These results are not comparable "
+                        "to a 2 MB-page tool such as MLC.</div></div>")
     if _lp.get("fallback_reason"):
         pages_banner = (
             "<div class='knee-callout'><div class='title'>2 MB pages unavailable &mdash; this run used 4 KB pages</div>"
@@ -2930,8 +3189,8 @@ tr:hover td {{ background:#16213e; }}
 </div>
 
 <div class="stats-row">
-    <div class="stat-box"><div class="val">{baseline:.1f} ns</div><div class="lbl">Baseline (unloaded)</div></div>
-    <div class="stat-box"><div class="val" style="color:{severity_color}">{worst:.1f} ns</div><div class="lbl">Worst Case (loaded)</div></div>
+    <div class="stat-box"><div class="val">{baseline:.1f} ns</div><div class="lbl">Baseline (unloaded){_lp_stat_tag}</div></div>
+    <div class="stat-box"><div class="val" style="color:{severity_color}">{worst:.1f} ns</div><div class="lbl">Worst Case (loaded){_lp_stat_tag}</div></div>
     <div class="stat-box"><div class="val">{peak_bw:.1f} GB/s</div><div class="lbl">Peak Aggregate BW</div></div>
     <div class="stat-box"><div class="val">{degradation:.1f}x</div><div class="lbl">Degradation Factor</div></div>
 </div>
@@ -3666,13 +3925,13 @@ class MemLatPro:
                 raise
             alloc, forced = alloc_i64, False        # no page-size control on this OS
         buf, n_nodes = build_tlb_chase(size_bytes, page_sz, rng=self.rng, alloc=alloc)
-        if page_mode == "2m" and sys.platform.startswith("linux"):
-            cov = hugepage_coverage_pct(buf)
-            if cov is None or cov < LINUX_2M_MIN_COVERAGE_PCT:
+        if page_mode == "2m":
+            try:
+                verify_2m_coverage(buf)          # 6.98.1: every OS (was Linux only)
+            except LargePageUnavailable:
                 del buf
                 gc.collect()
-                raise LargePageUnavailable(
-                    f"only {cov if cov is not None else '?'}% of the buffer got 2 MB pages")
+                raise
         return buf, n_nodes, {"page_kb": 2048 if page_mode == "2m" else mmap.PAGESIZE // 1024,
                               "page_size_forced": forced,
                               "node_layout": "random line per page"}
@@ -3769,16 +4028,17 @@ class MemLatPro:
         alloc = make_page_allocator(mode)           # may raise LargePageUnavailable
         buf, n_nodes = build_random_chase(size_bytes, 64, rng=self.rng, alloc=alloc)
         out: Dict[str, Any] = {"available": True, "mode": mode}
-        cov = hugepage_coverage_pct(buf) if sys.platform.startswith("linux") else None
-        if sys.platform.startswith("linux"):
-            out["hugepage_coverage_pct"] = cov
-            if mode == "2m" and (cov is None or cov < LINUX_2M_MIN_COVERAGE_PCT):
+        # (6.98.1) 2 MB runs are verified on every OS (was Linux only); the
+        # coverage is recorded on Windows too.
+        if mode == "2m":
+            try:
+                out["hugepage_coverage_pct"] = verify_2m_coverage(buf)
+            except LargePageUnavailable:
                 del buf
                 gc.collect()
-                raise LargePageUnavailable(
-                    f"only {cov if cov is not None else '?'}% of the buffer got 2 MB pages",
-                    "Memory is fragmented. Run soon after boot, or: echo 1 | sudo tee "
-                    "/proc/sys/vm/compact_memory")
+                raise
+        elif sys.platform.startswith("linux") or sys.platform == "win32":
+            out["hugepage_coverage_pct"] = hugepage_coverage_pct(buf)
         out["page_kb"] = 2048 if mode == "2m" else 4
         target_sec, iters = get_timing_budget(size_bytes, self.cfg, self.fast, self.quick)
         traversals = calibrate_chase(buf, n_nodes, target_sec)
@@ -3814,7 +4074,7 @@ class MemLatPro:
         for mode in ("4k", "2m"):
             try:
                 pm[mode] = self._measure_random_paged(size, mode)
-                extra = (f", THP coverage {pm[mode]['hugepage_coverage_pct']}%"
+                extra = (f", 2 MB-page coverage {pm[mode]['hugepage_coverage_pct']}%"
                          if pm[mode].get("hugepage_coverage_pct") is not None else "")
                 self._log(f"    {mode.upper():>3} pages: {pm[mode]['median_ns']:6.1f} ns{extra}")
             except LargePageUnavailable as e:
@@ -6646,6 +6906,165 @@ def _refuse_and_exit() -> None:
     sys.exit(1)
 
 
+HUGEPAGE_CHECK_SIZES_MB = (64, 2048)
+
+
+def run_hugepage_check(sizes_mb=HUGEPAGE_CHECK_SIZES_MB) -> int:
+    """
+    (6.98.1) --hugepage-check: large-page diagnosis, NumPy only (no Numba).
+    Windows: elevation and UAC elevation type, SeLockMemoryPrivilege before and
+    after enabling it, GetLargePageMinimum(), a 64 MB 4 KB-page control buffer
+    (must read 0% large: proves the readback tells the page sizes apart), then
+    for each size VirtualAlloc(MEM_LARGE_PAGES) + QueryWorkingSetEx readback.
+    Linux: THP settings, the same control and sizes via MADV_HUGEPAGE + smaps.
+    64 MB first separates "large pages do not work" from "not at this size".
+    Returns 0 when the control and every size pass, else 1.
+    """
+    need = min_2m_coverage_pct()
+    bits = ctypes.sizeof(ctypes.c_void_p) * 8
+    print("=" * 72)
+    print(f"  MemLat Pro v{VERSION} -- large-page check")
+    print("=" * 72)
+    print(f"  Platform : {platform.platform()}")
+    print(f"  Python   : {platform.python_version()} ({bits}-bit), NumPy {np.__version__}")
+    if HAS_PSUTIL:
+        print(f"  Free RAM : {psutil.virtual_memory().available >> 20} MB available")
+    print(f"  Pass mark: >= {need:.0f}% of every 4 KB page of the buffer on a 2 MB page")
+    print()
+
+    if sys.platform == "win32":
+        def alloc_2m(n):
+            return _win_alloc_large_i64(n)[0]
+
+        def coverage(a):
+            info = _win_ws_coverage(int(a.ctypes.data), int(a.nbytes))
+            return info["large_pct"], (f"{info['valid_pct']}% resident, "
+                                       f"{info['pages']} x 4 KB entries (QueryWorkingSetEx)")
+        try:
+            tok = _win_token_info()
+        except Exception as e:
+            tok = {"error": str(e)}
+        et = tok.get("elevation_type")
+        print(f"  Elevated              : {tok.get('elevated')}  (elevation type: {et})")
+        print("                          " + {
+            "limited": "administrator account WITHOUT elevation: UAC removes "
+                       "SeLockMemoryPrivilege. Run as administrator.",
+            "full": "administrator account, elevated.",
+            "default": "no split token (standard user, or UAC off): elevation does "
+                       "not change this process's privileges."}.get(et, "unknown"))
+        print(f"  SeLockMemoryPrivilege : {tok.get('lock_memory_privilege')}  (before enabling)")
+        if tok.get("lock_memory_privilege") == "absent":
+            print("                          not in this token: the right is not assigned to "
+                  "this account or its groups, you have not signed out and in since "
+                  "assigning it, or UAC removed it (see above).")
+        if tok.get("error"):
+            print(f"                          ({tok['error']})")
+        try:
+            ok, why = _win_enable_lock_memory_privilege()
+        except Exception as e:
+            ok, why = False, f"error: {e}"
+        print("  AdjustTokenPrivileges : " + ("ok" if ok else
+              "error 1300 ERROR_NOT_ALL_ASSIGNED (privilege not held)" if why == "not_held" else why))
+        try:
+            print(f"  SeLockMemoryPrivilege : {_win_token_info().get('lock_memory_privilege')}  "
+                  f"(after enabling)")
+        except Exception:
+            pass
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetLargePageMinimum.restype = ctypes.c_size_t
+        lp_min = int(k32.GetLargePageMinimum() or 0)
+        print(f"  GetLargePageMinimum() : {lp_min} bytes"
+              + (f" ({lp_min >> 20} MB)" if lp_min else " (large pages not supported)"))
+        control_alloc = alloc_i64
+    elif sys.platform.startswith("linux"):
+        thp = "/sys/kernel/mm/transparent_hugepage"
+        print(f"  THP enabled           : {_read_text(f'{thp}/enabled')}")
+        print(f"  THP defrag            : {_read_text(f'{thp}/defrag')}")
+        print(f"  THP page size         : {_read_text(f'{thp}/hpage_pmd_size')} bytes")
+
+        def alloc_2m(n):
+            return make_page_allocator("2m")(n)
+
+        def coverage(a):
+            return hugepage_coverage_pct(a), "AnonHugePages in /proc/self/smaps"
+
+        def control_alloc(n):
+            return _linux_alloc_i64(n, huge=False)
+    else:
+        print(f"  Large-page check not implemented on {sys.platform}.")
+        return 1
+
+    def _touch(a):
+        a[::512] = 1        # one write per 4 KB page: everything resident before the readback
+
+    passed: List[bool] = []
+    print()
+    try:
+        ctrl = control_alloc((64 << 20) // 8)
+        _touch(ctrl)
+        cov, how = coverage(ctrl)
+        ctrl_ok = cov is not None and cov == 0.0
+        print(f"  Control, 64 MB on 4 KB pages : {cov}% on 2 MB pages, {how} -> "
+              + ("OK (readback distinguishes 4 KB from 2 MB)" if ctrl_ok else "UNEXPECTED"))
+        del ctrl
+    except Exception as e:
+        ctrl_ok = False
+        print(f"  Control, 64 MB on 4 KB pages : readback failed -- {e}")
+    gc.collect()
+
+    for mb in sizes_mb:
+        label = f"  {mb:>5} MB on 2 MB pages      :"
+        if HAS_PSUTIL and psutil.virtual_memory().available < (mb + 512) << 20:
+            print(f"{label} skipped -- not enough free RAM")
+            passed.append(False)
+            continue
+        t0 = time.perf_counter()
+        try:
+            arr = alloc_2m((mb << 20) // 8)
+        except LargePageUnavailable as e:
+            print(f"{label} FAILED -- {e.reason}")
+            if e.hint:
+                print(f"{'':>34} fix: {e.hint}")
+            passed.append(False)
+            continue
+        except Exception as e:
+            print(f"{label} FAILED -- {type(e).__name__}: {e}")
+            passed.append(False)
+            continue
+        dt = time.perf_counter() - t0
+        _touch(arr)
+        try:
+            cov, how = coverage(arr)
+        except Exception as e:
+            cov, how = None, f"readback failed -- {e}"
+        ok = cov is not None and cov >= need
+        print(f"{label} allocated in {dt * 1000:.0f} ms; {cov}% on 2 MB pages, {how} -> "
+              + ("PASS" if ok else "FAIL"))
+        passed.append(ok)
+        del arr
+        gc.collect()
+
+    print()
+    if ctrl_ok and passed and all(passed):
+        print(f"  RESULT: PASS -- 2 MB pages work up to {max(sizes_mb)} MB. A MemLat run that")
+        print("          prints 'Latency buffer pages: 2 MB (verified ...)' is on 2 MB pages.")
+        rc = 0
+    elif passed and passed[0] and not all(passed):
+        print("  RESULT: large pages work, but not at the larger size right now. Physical")
+        print("          memory is too fragmented (or too full) for that many 2 MB pages.")
+        print("          Reboot and run MemLat before starting other applications.")
+        rc = 1
+    elif not ctrl_ok and passed and all(passed):
+        print("  RESULT: allocations passed, but the 4 KB control did not read 0%, so the")
+        print("          coverage readback itself is not trustworthy on this system.")
+        rc = 1
+    else:
+        print("  RESULT: FAIL -- large pages do not work at all. Fix the first failing line above.")
+        rc = 1
+    print("=" * 72)
+    return rc
+
+
 def _run_loaded_latency_guarded(**kwargs) -> None:
     """(6.98) A failure inside the loaded latency test is reported, not left
     to close the console window with an unread traceback."""
@@ -6680,8 +7099,17 @@ def main() -> None:
                         help="Run loaded latency stress test (Chips & Cheese method)")
     parser.add_argument("--compare", nargs=2, metavar=("A.json", "B.json"),
                         help="Compare two result files")
+    parser.add_argument("--hugepage-check", action="store_true",
+                        help="Large-page diagnosis only: elevation, privilege, "
+                             "GetLargePageMinimum, 64 MB and 2 GB test allocations")
     args = parser.parse_args()
- 
+
+    # ── Large-page diagnosis (6.98.1); needs NumPy only ──
+    if args.hugepage_check:
+        rc = run_hugepage_check()
+        _pause()
+        sys.exit(rc)
+
     # ── Comparison mode ──
     if args.compare:
         compare_runs(args.compare[0], args.compare[1])
