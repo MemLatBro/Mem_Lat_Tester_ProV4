@@ -33,6 +33,7 @@ Usage:
     python memlat_pro.py --no-menu --bandwidth     # CLI only, add bandwidth
     python memlat_pro.py --no-menu --rfo           # CLI only, add cross-core RFO test
     python memlat_pro.py --hugepage-check          # large-page diagnostics only
+    python memlat_pro.py --topology                # OS core/cache topology only
 
 Changes in 6.96.0 (each checkpoint file carries VERSION "6.96.0-cpN"):
   cp1  Removed the P<->E interconnect test (it timed a single Python store,
@@ -156,6 +157,38 @@ Changes in 6.98.1:
     before/after enabling, GetLargePageMinimum(), then allocates 64 MB and
     2 GB on large pages and reads back their coverage, with a 4 KB control
     buffer that must read 0%. Needs NumPy only (no Numba).
+
+Changes in 6.98.2:
+  - Topology and cache sizes come from the OS on Windows as well as Linux
+    (new Section 4B). Windows: GetLogicalProcessorInformationEx(RelationAll);
+    Linux: sysfs (core_cpus_list, cache/index*, cpu_atom/cpu_core for hybrid).
+    Both are reduced by the same code to one structure: physical cores (lowest
+    logical CPU of each core), SMT siblings, efficiency class (P/E), which
+    cores share an L3 (= one CCD on Ryzen) and each core's L1d/L2/L3 size.
+    Before, Windows guessed "even logical CPUs are cores, 8 cores per CCD":
+    wrong on 6+6 parts (7900X/7900X3D: 8+4), with SMT off (half the cores
+    missing, workers on wrong cores) and on hybrid Intel (P/E split = "first
+    third of all CPUs"). On a 7800X3D with SMT on the guess happened to be
+    right, so results there do not change.
+  - Everything reads that one structure: P/E core lists (--core P/E pinning),
+    cache config (test sizes, summary windows, buffer sizing), the loaded
+    latency test's latency core, same-CCD / other-CCD lists and loading order
+    (new loaded_latency_plan()), the CCD boundary in its plot, the cross-core
+    RFO pairs and their shared-L3 check (was Linux only), and the SMT state.
+    The CPU table remains the fallback and the source of expected latencies.
+    "hybrid" now follows the OS: an Alder/Raptor Lake with E-cores disabled is
+    not hybrid (its E-core L2 test sizes are no longer added).
+  - On a hybrid CPU the loaded latency test's latency core is a P-core and
+    E-core workers are labelled "(E-core)".
+  - Linux: the never-present 'topology/core_type' sysfs read and the separate
+    _sysfs_core_groups()/read_sysfs_caches() are replaced by the same code.
+  - Recorded: meta.run_context.topology (sweep JSON), topology.group_source /
+    os_topology (loaded latency JSON), a "Topo" console line, the source in
+    both HTML reports. A WARNING is printed when the layout had to be guessed.
+  - New --topology: prints what the OS reports and where each test would run
+    (latency core, loading order, RFO core pairs). Needs NumPy only.
+  - CPUs outside Windows processor group 0 (systems with > 64 logical CPUs)
+    are left out, with a note: the pinning code cannot address them.
 """
  
 # ══════════════════════════════════════════════════════════════════════════════
@@ -222,7 +255,7 @@ QUICK_MAX_MB          = 256
 QUICK_TRAVERSAL_SCALE = 0.70
 DEFAULT_RNG_SEED      = 42
  
-VERSION = "6.98.1"
+VERSION = "6.98.2"
 
 
 def _pause(prompt: str = "\n  Press Enter to exit...") -> None:
@@ -497,37 +530,29 @@ def _classify_gen(info: Dict) -> Optional[str]:
  
  
 def _detect_hybrid_topology(info: Dict) -> None:
+    """P-core / E-core lists. (6.98.2) From the OS topology (Section 4B) on
+    Windows and Linux: P = the cores of the highest efficiency class, E = the
+    rest, primary logical CPU of each core only. The old guesses (Linux
+    'topology/core_type', which mainline kernels do not have, and "first third
+    of all CPUs" for hybrid Intel) remain only for when the OS gives nothing."""
+    topo = detect_topology()
+    if topo.get("available"):
+        info["p_cores"] = list(topo["p_cores"])
+        info["e_cores"] = list(topo["e_cores"])
+        info["topology_source"] = topo["source"]
+        return
     p_cores, e_cores = [], []
-    if sys.platform.startswith("linux"):
-        cpu_base = "/sys/devices/system/cpu"
-        for cpu_dir in sorted(os.listdir(cpu_base)):
-            if not re.match(r"cpu\d+$", cpu_dir):
-                continue
-            idx = int(cpu_dir[3:])
-            type_path = os.path.join(cpu_base, cpu_dir, "topology", "core_type")
-            try:
-                with open(type_path) as f:
-                    core_type = f.read().strip().lower()
-                if core_type in ("performance", "p"):
-                    p_cores.append(idx)
-                else:
-                    e_cores.append(idx)
-            except OSError:
-                pass
-    if not p_cores and not e_cores:
+    if INTEL_CONFIGS.get(info.get("gen_key", ""), {}).get("hybrid"):
         all_cpus = info["all_cores"]
-        n = len(all_cpus)
-        gen_key = info.get("gen_key", "")
-        if INTEL_CONFIGS.get(gen_key, {}).get("hybrid"):
-            split = max(1, n // 3)
-            p_cores = all_cpus[:split]
-            e_cores = all_cpus[split:]
-        else:
-            p_cores = all_cpus
+        split = max(1, len(all_cpus) // 3)
+        p_cores, e_cores = all_cpus[:split], all_cpus[split:]
+    else:
+        p_cores = info["all_cores"]
     info["p_cores"] = p_cores
     info["e_cores"] = e_cores
- 
- 
+    info["topology_source"] = "heuristic"
+
+
 def _parse_cache_size_kb(text: Optional[str]) -> Optional[int]:
     """'32K' / '1024K' / '96M' -> KB"""
     m = re.match(r"\s*(\d+)\s*([KMG]?)", text or "", re.IGNORECASE)
@@ -538,32 +563,333 @@ def _parse_cache_size_kb(text: Optional[str]) -> Optional[int]:
     return kb if kb > 0 else None
 
 
-def read_sysfs_caches(cpu: int = 0) -> Dict:
-    """(6.98) Linux: data/unified cache sizes of one logical CPU and the CPUs
-    that share each level, from /sys/devices/system/cpu/cpuN/cache.
-    Returns {} where sysfs is not available (other OSes, some containers)."""
-    out: Dict[str, Any] = {}
-    base = f"/sys/devices/system/cpu/cpu{cpu}/cache"
+# ══════════════════════════════════════════════════════════════════════════════
+#  Section 4B — CPU topology and cache sizes from the OS  [6.98.2]
+#  One structure, built once per process, is the source for: physical cores,
+#  SMT siblings, P/E cores (efficiency class), which cores share an L3 (= one
+#  CCD on Ryzen), and the L1d/L2/L3 sizes of each core.
+#    Windows: GetLogicalProcessorInformationEx(RelationAll)
+#    Linux  : /sys/devices/system/cpu (core_cpus_list, cache/index*, cpu_atom)
+#  Both feed _finalize_topology(), so the two OSes are interpreted identically.
+#  Before 6.98.2 Windows guessed: "even logical CPUs are cores, 8 cores per
+#  CCD". That was wrong on 6+6 parts (7900X/7900X3D), with SMT off, and on
+#  hybrid Intel. The CPU table is now only a fallback and the source of the
+#  expected latencies.
+# ══════════════════════════════════════════════════════════════════════════════
+_TOPOLOGY_CACHE: Optional[Dict] = None
+
+# GetLogicalProcessorInformationEx (winnt.h)
+_GLPI_REL_CORE = 0                    # RelationProcessorCore
+_GLPI_REL_CACHE = 2                   # RelationCache
+_GLPI_REL_ALL = 0xFFFF                # RelationAll
+_GLPI_CACHE_TYPES = {0: "unified", 1: "instruction", 2: "data", 3: "trace"}
+_ERROR_INSUFFICIENT_BUFFER = 122
+
+
+def _win_glpi_ex_buffer() -> bytes:
+    """Raw SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX records (RelationAll)."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    fn = kernel32.GetLogicalProcessorInformationEx
+    fn.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    fn.restype = ctypes.c_int
+    need = ctypes.c_uint32(0)
+    fn(_GLPI_REL_ALL, None, ctypes.byref(need))
+    err = ctypes.get_last_error()
+    if need.value == 0:
+        raise OSError(err, f"GetLogicalProcessorInformationEx size query failed (error {err})")
+    for _ in range(3):                          # the size can grow (CPU hot-add)
+        buf = ctypes.create_string_buffer(need.value)
+        if fn(_GLPI_REL_ALL, buf, ctypes.byref(need)):
+            return buf.raw[:need.value]
+        err = ctypes.get_last_error()
+        if err != _ERROR_INSUFFICIENT_BUFFER:
+            break
+    raise OSError(err, f"GetLogicalProcessorInformationEx failed (error {err})")
+
+
+def parse_glpi_ex(buf: bytes, ptr_size: int = 8) -> Dict:
+    """
+    Parse GetLogicalProcessorInformationEx output into the common topology
+    structure. Pure function of the bytes, so it is testable off Windows.
+    Layout (winnt.h; ptr_size = sizeof(KAFFINITY) = 8 on 64-bit Python):
+      record : DWORD Relationship @0, DWORD Size @4, union @8
+      GROUP_AFFINITY: KAFFINITY Mask @0, WORD Group @ptr_size, WORD Reserved[3]
+      PROCESSOR_RELATIONSHIP (core): BYTE Flags @0 (LTP_PC_SMT = 1),
+        BYTE EfficiencyClass @1, BYTE Reserved[20], WORD GroupCount @22,
+        GROUP_AFFINITY GroupMask[] @24
+      CACHE_RELATIONSHIP: BYTE Level @0, BYTE Associativity @1, WORD LineSize @2,
+        DWORD CacheSize @4, DWORD Type @8, BYTE Reserved[18], WORD GroupCount @30,
+        GROUP_AFFINITY GroupMasks[] @32. Windows before 11 / Server 2022 left
+        GroupCount at 0 (it was Reserved): then exactly one GroupMask follows.
+    Logical CPU numbers are the bit numbers of processor group 0, the same
+    numbers SetThreadAffinityMask and psutil.cpu_affinity use. CPUs in other
+    groups (systems with more than 64 logical CPUs) are left out: this tool
+    cannot pin to them. A note says so.
+    """
+    def u8(o):
+        return buf[o]
+
+    def u16(o):
+        return int.from_bytes(buf[o:o + 2], "little")
+
+    def u32(o):
+        return int.from_bytes(buf[o:o + 4], "little")
+
+    ga_size = ptr_size + 8                         # Mask + Group + Reserved[3]
+    notes: List[str] = []
+    groups_seen = set()
+
+    def masks(off: int, count: int, end: int) -> List[int]:
+        cpus: List[int] = []
+        for k in range(count):
+            o = off + k * ga_size
+            if o + ga_size > end:
+                notes.append("truncated GROUP_AFFINITY array in a record")
+                break
+            mask = int.from_bytes(buf[o:o + ptr_size], "little")
+            group = u16(o + ptr_size)
+            groups_seen.add(group)
+            if group != 0:
+                continue
+            cpus.extend(b for b in range(ptr_size * 8) if (mask >> b) & 1)
+        return cpus
+
+    cores: List[Dict] = []
+    caches: List[Dict] = []
+    off, n = 0, len(buf)
+    while off + 8 <= n:
+        rel, size = u32(off), u32(off + 4)
+        if size < 8 or off + size > n:
+            notes.append(f"malformed record at offset {off} (size {size}); parsing stopped")
+            break
+        body, end = off + 8, off + size
+        if rel == _GLPI_REL_CORE and body + 24 <= end:
+            cnt = u16(body + 22) or 1
+            threads = masks(body + 24, cnt, end)
+            if threads:
+                cores.append({"threads": sorted(threads),
+                              "efficiency_class": u8(body + 1),
+                              "smt_flag": bool(u8(body) & 1)})
+        elif rel == _GLPI_REL_CACHE and body + 32 <= end:
+            cnt = u16(body + 30) or 1
+            cpus = masks(body + 32, cnt, end)
+            if cpus:
+                caches.append({"level": u8(body),
+                               "type": _GLPI_CACHE_TYPES.get(u32(body + 8), "unknown"),
+                               "size_kb": u32(body + 4) // 1024,
+                               "line_bytes": u16(body + 2),
+                               "associativity": u8(body + 1),
+                               "cpus": sorted(set(cpus))})
+        off += size
+    if len(groups_seen) > 1:
+        notes.append(f"{len(groups_seen)} processor groups: only group 0 is used "
+                     f"(logical CPUs in other groups cannot be pinned by this tool)")
+    return _finalize_topology(cores, caches, "GetLogicalProcessorInformationEx", notes)
+
+
+def _linux_topology(base: str = "/sys/devices/system/cpu") -> Optional[Dict]:
+    """Same structure from Linux sysfs. Hybrid Intel: cpu_core = P, cpu_atom = E."""
     try:
-        entries = sorted(os.listdir(base))
+        cpus = sorted(int(d[3:]) for d in os.listdir(base) if re.match(r"cpu\d+$", d))
     except OSError:
-        return out
-    for idx in entries:
-        if not idx.startswith("index"):
-            continue
-        level = _read_text(f"{base}/{idx}/level")
-        ctype = (_read_text(f"{base}/{idx}/type") or "").lower()
-        size_kb = _parse_cache_size_kb(_read_text(f"{base}/{idx}/size"))
-        if not level or not level.isdigit() or size_kb is None or ctype == "instruction":
-            continue
-        lvl = int(level)
-        if lvl in (1, 2, 3):
-            out[f"l{lvl}_kb"] = size_kb
+        return None
+    online = [c for c in cpus if _read_text(f"{base}/cpu{c}/online") != "0"]
+    atom: set = set()
+    big: set = set()
+    try:
+        atom = set(_parse_cpu_list(_read_text("/sys/devices/cpu_atom/cpus")))
+        big = set(_parse_cpu_list(_read_text("/sys/devices/cpu_core/cpus")))
+    except ValueError:
+        pass
+    seen_cores: Dict[Tuple[int, ...], Dict] = {}
+    seen_caches: Dict[Tuple, Dict] = {}
+    for c in online:
+        try:
+            sib = _parse_cpu_list(_read_text(f"{base}/cpu{c}/topology/core_cpus_list")
+                                  or _read_text(f"{base}/cpu{c}/topology/thread_siblings_list"))
+        except ValueError:
+            sib = []
+        sib = sorted(s for s in (sib or [c]) if s in online) or [c]
+        key = tuple(sib)
+        if key not in seen_cores:
+            eff = 0 if (atom and c in atom) else (1 if atom else 0)
+            seen_cores[key] = {"threads": list(key), "efficiency_class": eff,
+                               "smt_flag": len(key) > 1}
+        cbase = f"{base}/cpu{c}/cache"
+        try:
+            entries = sorted(os.listdir(cbase))
+        except OSError:
+            entries = []
+        for idx in entries:
+            if not idx.startswith("index"):
+                continue
+            level = _read_text(f"{cbase}/{idx}/level")
+            ctype = (_read_text(f"{cbase}/{idx}/type") or "").lower()
+            size_kb = _parse_cache_size_kb(_read_text(f"{cbase}/{idx}/size"))
+            if not level or not level.isdigit() or size_kb is None:
+                continue
             try:
-                out[f"l{lvl}_shared"] = _parse_cpu_list(_read_text(f"{base}/{idx}/shared_cpu_list"))
+                shared = _parse_cpu_list(_read_text(f"{cbase}/{idx}/shared_cpu_list"))
             except ValueError:
-                out[f"l{lvl}_shared"] = []
-    return out
+                shared = []
+            shared = sorted(s for s in (shared or [c]) if s in online) or [c]
+            ck = (int(level), ctype, tuple(shared))
+            if ck not in seen_caches:
+                line = _read_text(f"{cbase}/{idx}/coherency_line_size")
+                ways = _read_text(f"{cbase}/{idx}/ways_of_associativity")
+                seen_caches[ck] = {"level": int(level), "type": ctype or "unknown",
+                                   "size_kb": size_kb,
+                                   "line_bytes": int(line) if line and line.isdigit() else None,
+                                   "associativity": int(ways) if ways and ways.isdigit() else None,
+                                   "cpus": list(shared)}
+    if not seen_cores:
+        return None
+    notes = []
+    if atom and not big:
+        notes.append("cpu_atom PMU present but cpu_core missing")
+    return _finalize_topology(list(seen_cores.values()), list(seen_caches.values()),
+                              "sysfs", notes)
+
+
+def _finalize_topology(cores: List[Dict], caches: List[Dict], source: str,
+                       notes: List[str]) -> Dict:
+    """Derive everything MemLat uses from per-core and per-cache records.
+    'cpu' of a core = its lowest logical CPU (the one MemLat pins to)."""
+    cores = sorted(cores, key=lambda c: c["threads"][0])
+    lp_core: Dict[int, int] = {}                   # logical CPU -> core's primary
+    for c in cores:
+        c["cpu"] = c["threads"][0]
+        for t in c["threads"]:
+            lp_core[t] = c["cpu"]
+    physical = [c["cpu"] for c in cores]
+
+    classes = sorted({c["efficiency_class"] for c in cores})
+    top = classes[-1] if classes else 0
+    p_cores = [c["cpu"] for c in cores if c["efficiency_class"] == top]
+    e_cores = [c["cpu"] for c in cores if c["efficiency_class"] != top]
+
+    def per_core(cpu: int, level: int) -> Optional[Dict]:
+        """Data (or unified) cache of `level` that contains logical CPU `cpu`."""
+        for ca in caches:
+            if ca["level"] == level and ca["type"] in ("data", "unified") and cpu in ca["cpus"]:
+                return ca
+        return None
+
+    # L3 groups: one per distinct L3, holding the primaries of the cores it covers
+    l3_groups: List[List[int]] = []
+    l3_sizes: List[Optional[int]] = []
+    seen = set()
+    for c in cores:
+        ca = per_core(c["cpu"], 3)
+        key = tuple(ca["cpus"]) if ca else None
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        members = sorted({lp_core[t] for t in ca["cpus"] if t in lp_core})
+        l3_groups.append(members)
+        l3_sizes.append(ca["size_kb"])
+    covered = {m for g in l3_groups for m in g}
+    rest = [p for p in physical if p not in covered]
+    if not l3_groups:
+        l3_groups, l3_sizes = ([physical[:]], [None]) if physical else ([], [])
+        if physical:
+            notes.append("the OS reported no L3: all cores treated as one group")
+    elif rest:
+        l3_groups.append(rest)
+        l3_sizes.append(None)
+        notes.append(f"cores {rest} are in no reported L3: grouped separately")
+    order = sorted(range(len(l3_groups)), key=lambda i: l3_groups[i][0])
+    l3_groups = [l3_groups[i] for i in order]
+    l3_sizes = [l3_sizes[i] for i in order]
+    group_of = {p: gi for gi, g in enumerate(l3_groups) for p in g}
+
+    for c in cores:
+        l1, l2, l3 = per_core(c["cpu"], 1), per_core(c["cpu"], 2), per_core(c["cpu"], 3)
+        c["l1d_kb"] = l1["size_kb"] if l1 else None
+        c["l2_kb"] = l2["size_kb"] if l2 else None
+        c["l2_shared_by_cores"] = (len({lp_core[t] for t in l2["cpus"] if t in lp_core})
+                                   if l2 else None)
+        c["l3_kb"] = l3["size_kb"] if l3 else None
+        c["l3_group"] = group_of.get(c["cpu"])
+
+    def caches_of(cpu: Optional[int]) -> Dict:
+        core = next((c for c in cores if c["cpu"] == cpu), None)
+        if core is None:
+            return {}
+        return {"cpu": cpu, "l1d_kb": core["l1d_kb"], "l2_kb": core["l2_kb"],
+                "l2_shared_by_cores": core["l2_shared_by_cores"], "l3_kb": core["l3_kb"]}
+
+    if len({s for s in l3_sizes if s}) > 1:
+        notes.append("L3 groups differ in size: " + ", ".join(
+            f"group {i} = {s // 1024 if s and s >= 1024 else s} {'MB' if s and s >= 1024 else 'KB'}"
+            for i, s in enumerate(l3_sizes)) + " (cache config uses the reference core's)")
+    return {
+        "available": bool(cores),
+        "source": source,
+        "logical_cpus": sorted(lp_core),
+        "n_logical": len(lp_core),
+        "physical_cores": physical,
+        "n_physical": len(physical),
+        "smt_active": any(len(c["threads"]) > 1 for c in cores),
+        "hybrid": len(classes) > 1,
+        "efficiency_classes": classes,
+        "p_cores": p_cores,
+        "e_cores": e_cores,
+        "l3_groups": l3_groups,
+        "l3_group_sizes_kb": l3_sizes,
+        "reference_cpu": p_cores[0] if p_cores else None,
+        "caches": caches_of(p_cores[0] if p_cores else None),
+        "caches_e": caches_of(e_cores[0] if e_cores else None),
+        "cores": cores,
+        "notes": notes,
+    }
+
+
+def detect_topology(refresh: bool = False) -> Dict:
+    """The topology of this machine (cached). {'available': False, ...} when
+    the OS gives nothing usable; callers then fall back to their heuristics."""
+    global _TOPOLOGY_CACHE
+    if _TOPOLOGY_CACHE is not None and not refresh:
+        return _TOPOLOGY_CACHE
+    topo: Optional[Dict] = None
+    err: Optional[str] = None
+    try:
+        if sys.platform == "win32":
+            topo = parse_glpi_ex(_win_glpi_ex_buffer(), ctypes.sizeof(ctypes.c_void_p))
+        elif sys.platform.startswith("linux"):
+            topo = _linux_topology()
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    if not topo or not topo.get("available"):
+        topo = {"available": False, "source": None,
+                "error": err or f"no OS topology source on {sys.platform}",
+                "physical_cores": [], "p_cores": [], "e_cores": [], "l3_groups": [],
+                "notes": []}
+    _TOPOLOGY_CACHE = topo
+    return topo
+
+
+def topology_summary(topo: Optional[Dict] = None) -> Dict:
+    """Compact form for the JSON run context (no per-core list)."""
+    topo = topo or detect_topology()
+    if not topo.get("available"):
+        return {"available": False, "error": topo.get("error")}
+    return {k: topo.get(k) for k in (
+        "source", "n_logical", "n_physical", "smt_active", "hybrid", "efficiency_classes",
+        "physical_cores", "p_cores", "e_cores", "l3_groups", "l3_group_sizes_kb",
+        "reference_cpu", "caches", "caches_e", "notes")}
+
+
+def topology_line(topo: Optional[Dict] = None) -> str:
+    """One line for consoles and reports: '8C/16T, SMT on, 1 L3 group [8] (source)'."""
+    topo = topo or detect_topology()
+    if not topo.get("available"):
+        return f"not available from the OS ({topo.get('error')}) -- using heuristics"
+    pe = (f", {len(topo['p_cores'])}P+{len(topo['e_cores'])}E" if topo.get("hybrid") else "")
+    g = topo["l3_groups"]
+    return (f"{topo['n_physical']}C/{topo['n_logical']}T{pe}, SMT "
+            f"{'on' if topo['smt_active'] else 'off'}, {len(g)} L3 group"
+            f"{'s' if len(g) != 1 else ''} {[len(x) for x in g]}  ({topo['source']})")
 
 
 def _table_cache_config(cpu_info: Dict) -> Dict:
@@ -580,30 +906,45 @@ def _table_cache_config(cpu_info: Dict) -> Dict:
     return dict(DEFAULT_CONFIG)
 
 
-def get_cache_config(cpu_info: Dict, use_sysfs: bool = True) -> Dict:
+def _kb_to_mb(kb: int):
+    mb = kb / 1024
+    return int(mb) if float(mb).is_integer() else round(mb, 2)
+
+
+def get_cache_config(cpu_info: Dict, use_os: bool = True) -> Dict:
     """Cache sizes used for test sizes, summary windows and buffer sizing.
-    (6.98) On Linux the L1d / L2 / L3 sizes are read from sysfs, so they are
-    right for CPUs the table does not know (or misclassifies). The table is the
-    fallback (Windows, macOS, no sysfs) and still provides the expected
-    latencies, hybrid E-core sizes and notes. cfg["cache_source"] records which
-    one was used; cfg["table_cache"] keeps the table values when they differ."""
+    (6.98.2) The L1d / L2 / L3 sizes come from the OS topology on Windows and
+    Linux (6.98: Linux only), for the reference core: the first core of the
+    highest efficiency class. On hybrid CPUs the E-core L1d / L2 come from the
+    first E-core, and "hybrid" follows the OS (E-cores disabled in the BIOS =
+    not hybrid). The table is the fallback and still provides the expected
+    latencies and notes. cfg["cache_source"] records which one was used;
+    cfg["table_cache"] keeps the table values when they differ."""
     cfg = _table_cache_config(cpu_info)
     cfg["cache_source"] = "table"
-    if not (use_sysfs and sys.platform.startswith("linux")):
+    if not use_os:
         return cfg
-    cpu = (cpu_info.get("p_cores") or [0])[0]
-    sc = read_sysfs_caches(cpu)
-    if not (sc.get("l1_kb") and sc.get("l2_kb")):
+    topo = detect_topology()
+    oc = (topo.get("caches") or {}) if topo.get("available") else {}
+    if not (oc.get("l1d_kb") and oc.get("l2_kb")):
         return cfg
     table = {"l1_p_kb": cfg.get("l1_p_kb"), "l2_p_kb": cfg.get("l2_p_kb"), "l3_mb": cfg.get("l3_mb")}
-    cfg["l1_p_kb"] = sc["l1_kb"]
-    cfg["l2_p_kb"] = sc["l2_kb"]
-    if sc.get("l3_kb"):
-        mb = sc["l3_kb"] / 1024
-        cfg["l3_mb"] = int(mb) if float(mb).is_integer() else round(mb, 2)
-    cfg["cache_source"] = f"sysfs (cpu {cpu})"
+    cfg["l1_p_kb"] = oc["l1d_kb"]
+    cfg["l2_p_kb"] = oc["l2_kb"]
+    if oc.get("l3_kb"):
+        cfg["l3_mb"] = _kb_to_mb(oc["l3_kb"])
+    cfg["hybrid"] = bool(topo.get("hybrid"))
+    ec = topo.get("caches_e") or {}
+    if cfg["hybrid"] and ec.get("l1d_kb") and ec.get("l2_kb"):
+        cfg["l1_e_kb"], cfg["l2_e_kb"] = ec["l1d_kb"], ec["l2_kb"]
+    elif not cfg["hybrid"]:
+        cfg["l1_e_kb"] = cfg["l2_e_kb"] = None
+    sizes = [s for s in (topo.get("l3_group_sizes_kb") or []) if s]
+    if len(set(sizes)) > 1:
+        cfg["l3_mb_by_group"] = [_kb_to_mb(s) for s in sizes]
+    cfg["cache_source"] = f"{topo['source']} (cpu {oc.get('cpu')})"
     if cpu_info.get("gen_key") is None:
-        cfg["notes"] = ("CPU not in the table: cache sizes from sysfs, "
+        cfg["notes"] = ("CPU not in the table: cache sizes from the OS, "
                         "expected latencies are generic.")
     now = {"l1_p_kb": cfg["l1_p_kb"], "l2_p_kb": cfg["l2_p_kb"], "l3_mb": cfg["l3_mb"]}
     if now != table:
@@ -941,6 +1282,14 @@ def detect_smt_state() -> Dict:
         if active in ("0", "1"):
             st["smt_active"] = active == "1"
         st["smt_control"] = _read_text("/sys/devices/system/cpu/smt/control")
+    # (6.98.2) The OS topology (Windows and Linux) counts the cores and their
+    # sibling threads directly; it overrides psutil's count, not the kernel switch.
+    topo = detect_topology()
+    if topo.get("available"):
+        st["physical_cores"] = topo["n_physical"]
+        st["topology_source"] = topo["source"]
+        if st["smt_active"] is None:
+            st["smt_active"] = topo["smt_active"]
     if st["smt_active"] is None and logical and physical:
         st["smt_active"] = logical > physical
     return st
@@ -1819,15 +2168,19 @@ def _parse_cpu_list(text: Optional[str]) -> List[int]:
 
 
 def _shares_l3(cpu_a: int, cpu_b: int) -> Optional[bool]:
-    """True/False from Linux sysfs cache topology; None where unavailable."""
-    base = f"/sys/devices/system/cpu/cpu{cpu_a}/cache"
-    try:
-        for idx in sorted(os.listdir(base)):
-            if _read_text(f"{base}/{idx}/level") == "3":
-                return cpu_b in _parse_cpu_list(_read_text(f"{base}/{idx}/shared_cpu_list"))
-    except Exception:
-        pass
-    return None
+    """True/False from the OS topology (6.98.2: Windows too, was Linux sysfs
+    only); None where it is unavailable or a CPU is in no reported group."""
+    topo = detect_topology()
+    if not topo.get("available"):
+        return None
+    group_of: Dict[int, int] = {}
+    for c in topo.get("cores", []):
+        for t in c["threads"]:
+            if c.get("l3_group") is not None:
+                group_of[t] = c["l3_group"]
+    if cpu_a not in group_of or cpu_b not in group_of:
+        return None
+    return group_of[cpu_a] == group_of[cpu_b]
 
 
 def _pin_current_thread(cpu: int) -> bool:
@@ -2035,7 +2388,7 @@ def format_rfo_report(rfo: Optional[Dict]) -> List[str]:
     for p in rfo.get("pairs", []):
         rel = p.get("label", "")
         sl3 = p.get("shares_l3")
-        rel += "" if sl3 is None else (" (sysfs: shared L3)" if sl3 else " (sysfs: separate L3)")
+        rel += "" if sl3 is None else (" (OS: shared L3)" if sl3 else " (OS: separate L3)")
         lines.append(f"    Core A={p['core_a']} takes lines from core B={p['core_b']} -- {rel}")
         lines.append(f"      {'Variant':<30} {'median':>8} {'p5':>8} {'p95':>8}   ns/hop")
         for key, label in names:
@@ -2233,118 +2586,104 @@ class _BandwidthWorkerMP:
         return self._bytes_per_pass
 
 
-def _sysfs_core_groups() -> Tuple[List[int], List[List[int]]]:
-    """(6.98) Linux: (first logical CPU of every online physical core, those
-    cores grouped by the L3 they share). ([], []) when sysfs has no topology;
-    (cores, []) when it has no L3 sharing information."""
-    base = "/sys/devices/system/cpu"
-    try:
-        cpus = sorted(int(d[3:]) for d in os.listdir(base) if re.match(r"cpu\d+$", d))
-    except OSError:
-        return [], []
-    phys: List[int] = []
-    for c in cpus:
-        if _read_text(f"{base}/cpu{c}/online") == "0":
-            continue
-        try:
-            sib = _parse_cpu_list(_read_text(f"{base}/cpu{c}/topology/core_cpus_list")
-                                  or _read_text(f"{base}/cpu{c}/topology/thread_siblings_list"))
-        except ValueError:
-            sib = []
-        if sib and min(sib) == c:
-            phys.append(c)
-    groups: Dict[int, List[int]] = {}
-    for c in phys:
-        shared = read_sysfs_caches(c).get("l3_shared")
-        if not shared:
-            return phys, []
-        groups.setdefault(min(shared), []).append(c)
-    return phys, [groups[k] for k in sorted(groups)]
-
-
 def _detect_core_topology() -> Dict:
-    """Detect CCX/CCD topology for AMD or core layout for Intel.
-    Returns dict with 'physical_cores' list and 'ccx_groups' if detectable."""
-    result = {
+    """Core layout for the loaded latency and cross-core RFO tests.
+    (6.98.2) Comes from the OS topology (Section 4B) on Windows and Linux:
+    physical cores = the lowest logical CPU of each core, groups = cores that
+    share an L3 (one CCD on Ryzen; the whole chip on Intel). The old guesses
+    ("even logical CPUs are cores", "8 cores per CCD") remain only for when the
+    OS gives nothing, and group_source then says "heuristic"."""
+    result: Dict[str, Any] = {
         "physical_cores": [],
-        "ccx_groups": [],   # list of lists: [[core_ids in CCX0], [CCX1], ...]
-        "ccd_groups": [],   # list of lists: [[core_ids in CCD0], [CCD1], ...]
+        "ccx_groups": [],   # cores sharing an L3: [[CCD0 cores], [CCD1 cores], ...]
+        "ccd_groups": [],   # same lists (Zen 3+: one CCX per CCD)
         "vendor": "unknown",
+        "p_cores": [], "e_cores": [],
+        "group_source": "heuristic",
     }
-    n_logical = os.cpu_count() or 1
-
-    # Try to get physical core mapping
-    sysfs_groups: List[List[int]] = []
-    if sys.platform.startswith("linux"):
-        result["physical_cores"], sysfs_groups = _sysfs_core_groups()
-    if sys.platform.startswith("linux") and not result["physical_cores"]:
-        core_map = {}
-        try:
-            with open("/proc/cpuinfo") as f:
-                current_proc = None
-                for line in f:
-                    if line.startswith("processor"):
-                        current_proc = int(line.split(":")[1].strip())
-                    elif line.startswith("core id") and current_proc is not None:
-                        core_id = int(line.split(":")[1].strip())
-                        if core_id not in core_map:
-                            core_map[core_id] = current_proc
-                            result["physical_cores"].append(current_proc)
-        except OSError:
-            pass
-    elif sys.platform == "win32":
-        # On Windows, even logical cores 0,2,4,... are typically physical
-        # for SMT systems. Use every other core as approximation.
-        if n_logical >= 2:
-            result["physical_cores"] = list(range(0, n_logical, 2))
-        else:
-            result["physical_cores"] = [0]
-
-    if not result["physical_cores"]:
-        result["physical_cores"] = list(range(n_logical))
-
-    # For AMD Zen: CCX = 8 cores sharing L3 on Zen3+, CCD = 1 CCX on Zen3+
-    # We infer from core count and CPU model
     cpu_info = detect_cpu()
     model = cpu_info.get("model", "")
-    gen_key = cpu_info.get("gen_key", "")
-
     if "AMD" in cpu_info.get("vendor", "") or "AMD" in model:
         result["vendor"] = "AMD"
     elif "Intel" in cpu_info.get("vendor", "") or "Intel" in model:
         result["vendor"] = "Intel"
-    result["group_source"] = "heuristic"
 
-    if sysfs_groups:
-        # (6.98) cores grouped by the L3 they actually share (6+6 on a 7900X,
-        # every CCD on Threadripper/EPYC) instead of "8 cores per CCD".
-        result["ccx_groups"] = [g[:] for g in sysfs_groups]
-        result["ccd_groups"] = [g[:] for g in sysfs_groups]
-        result["group_source"] = "sysfs L3 sharing"
-    elif result["vendor"] == "AMD":
-        phys = result["physical_cores"]
-        n_phys = len(phys)
-        # Zen 3/4/5: 8 cores per CCX, 1 CCX per CCD
-        ccx_size = 8
-        if n_phys <= ccx_size:
-            # Single CCX/CCD chip (e.g., 7800X3D, 7600X)
-            result["ccx_groups"] = [phys[:]]
-            result["ccd_groups"] = [phys[:]]
-        else:
-            # Multi-CCD (e.g., 7950X, 9950X)
-            ccd0 = phys[:ccx_size]
-            ccd1 = phys[ccx_size:ccx_size * 2] if n_phys > ccx_size else []
-            result["ccx_groups"] = [g for g in [ccd0, ccd1] if g]
-            result["ccd_groups"] = [g for g in [ccd0, ccd1] if g]
-    elif result["vendor"] == "Intel":
-        # Intel monolithic: all cores on one die, ring/mesh bus
-        result["ccx_groups"] = [result["physical_cores"][:]]
-        result["ccd_groups"] = [result["physical_cores"][:]]
+    topo = detect_topology()
+    if topo.get("available"):
+        result["physical_cores"] = list(topo["physical_cores"])
+        result["ccx_groups"] = [g[:] for g in topo["l3_groups"]]
+        result["ccd_groups"] = [g[:] for g in topo["l3_groups"]]
+        result["p_cores"] = list(topo["p_cores"])
+        result["e_cores"] = list(topo["e_cores"])
+        result["group_source"] = f"{topo['source']} (L3 sharing)"
+        return result
+
+    # ── Fallback: no usable OS topology ──
+    n_logical = os.cpu_count() or 1
+    phys: List[int] = []
+    if sys.platform.startswith("linux"):
+        core_map: Dict[Tuple[int, int], int] = {}
+        try:
+            with open("/proc/cpuinfo") as f:
+                proc, pkg = None, 0
+                for line in f:
+                    if line.startswith("processor"):
+                        proc = int(line.split(":")[1])
+                    elif line.startswith("physical id"):
+                        pkg = int(line.split(":")[1])
+                    elif line.startswith("core id") and proc is not None:
+                        key = (pkg, int(line.split(":")[1]))
+                        if key not in core_map:
+                            core_map[key] = proc
+                            phys.append(proc)
+        except (OSError, ValueError):
+            phys = []
+    elif sys.platform == "win32" and n_logical >= 2:
+        phys = list(range(0, n_logical, 2))        # guess: SMT on, siblings adjacent
+    result["physical_cores"] = phys or list(range(n_logical))
+    result["p_cores"] = list(cpu_info.get("p_cores") or result["physical_cores"])
+    result["e_cores"] = list(cpu_info.get("e_cores") or [])
+    phys = result["physical_cores"]
+    if result["vendor"] == "AMD" and len(phys) > 8:
+        groups = [phys[i:i + 8] for i in range(0, len(phys), 8)]  # guess: 8 per CCD
     else:
-        result["ccx_groups"] = [result["physical_cores"][:]]
-        result["ccd_groups"] = [result["physical_cores"][:]]
-
+        groups = [phys[:]]
+    result["ccx_groups"] = [g[:] for g in groups]
+    result["ccd_groups"] = [g[:] for g in groups]
     return result
+
+
+def loaded_latency_plan(topo: Dict) -> Dict:
+    """
+    (6.98.2) Where the loaded latency test runs what, from _detect_core_topology():
+      latency core : the first physical core (core 0, as before); on a hybrid
+                     CPU, if that is not a P-core, the first P-core
+      same_group   : the other cores sharing the latency core's L3, OS order
+      other_groups : cores of every other L3 group, group by group
+      order        : same_group + other_groups (bandwidth workers are added
+                     in this order, one per step)
+    One function, so the console lines, the JSON and the HTML cannot disagree.
+    """
+    phys = list(topo.get("physical_cores") or [])
+    p_cores = set(topo.get("p_cores") or [])
+    groups = [g for g in (topo.get("ccd_groups") or []) if g] or [phys[:]]
+    lat = phys[0] if phys else None
+    if lat is not None and p_cores and lat not in p_cores:
+        lat = next(c for c in phys if c in p_cores)
+    lat_group = next((i for i, g in enumerate(groups) if lat in g), 0)
+    same = [c for c in groups[lat_group] if c != lat and c in phys]
+    other: List[int] = []
+    group_of: Dict[int, int] = {}
+    for i, g in enumerate(groups):
+        for c in g:
+            group_of[c] = i
+            if i != lat_group and c in phys and c != lat:
+                other.append(c)
+    loose = [c for c in phys if c != lat and c not in same and c not in other]
+    other.extend(loose)                            # never drop a core
+    return {"latency_core": lat, "latency_group": lat_group, "same_group": same,
+            "other_groups": other, "order": same + other, "group_of": group_of,
+            "e_cores": sorted(set(topo.get("e_cores") or []) & set(phys))}
 
 
 def run_loaded_latency_test(
@@ -2451,41 +2790,33 @@ def run_loaded_latency_test(
         return {"error": "need >= 2 physical cores"}
 
     # ── Determine test scenarios ──
-    latency_core = phys_cores[0]
-    bw_cores = phys_cores[1:]  # all other physical cores
-
-    # Determine which CCD the latency core is on
-    lat_ccd_idx = 0
-    for idx, group in enumerate(topo["ccd_groups"]):
-        if latency_core in group:
-            lat_ccd_idx = idx
-            break
-
-    # Categorize bandwidth cores by same-CCX, same-CCD, other-CCD
-    same_ccx_cores = []
-    other_ccd_cores = []
-    for c in bw_cores:
-        in_lat_ccd = any(c in g for i, g in enumerate(topo["ccd_groups"]) if i == lat_ccd_idx)
-        if in_lat_ccd:
-            same_ccx_cores.append(c)
-        else:
-            other_ccd_cores.append(c)
-
-    # Build progressive core loading order:
-    # 1. Same CCX/CCD first (maximum contention at XI/IFOP level)
-    # 2. Other CCD (contention at memory controller level)
-    ordered_bw_cores = same_ccx_cores + other_ccd_cores
+    # (6.98.2) From the OS topology: same-L3 (same-CCD) cores first, maximum
+    # contention at the XI/IFOP level; then the other CCDs (memory controller).
+    plan = loaded_latency_plan(topo)
+    latency_core = plan["latency_core"]
+    lat_ccd_idx = plan["latency_group"]
+    same_ccx_cores = plan["same_group"]
+    other_ccd_cores = plan["other_groups"]
+    ordered_bw_cores = plan["order"]
+    e_core_set = set(plan["e_cores"])
 
     max_bw_threads = min(len(ordered_bw_cores), n_phys - 1)
     if max_bw_threads < 1:
         print("  ERROR: Not enough cores for bandwidth threads.")
         return {"error": "insufficient cores"}
 
-    print(f"\n  Latency core    : core {latency_core} (CCD {lat_ccd_idx})")
-    print(f"  Same-CCD BW     : {len(same_ccx_cores)} cores — {same_ccx_cores}")
-    print(f"  Other-CCD BW    : {len(other_ccd_cores)} cores — {other_ccd_cores}")
+    def _e(cores: List[int]) -> str:
+        return f"  (E-cores: {[c for c in cores if c in e_core_set]})" if e_core_set & set(cores) else ""
+    print(f"\n  Topology        : {topology_line()}")
+    print(f"  Groups from     : {topo.get('group_source')}")
+    print(f"  Latency core    : core {latency_core} (CCD {lat_ccd_idx})")
+    print(f"  Same-CCD BW     : {len(same_ccx_cores)} cores — {same_ccx_cores}{_e(same_ccx_cores)}")
+    print(f"  Other-CCD BW    : {len(other_ccd_cores)} cores — {other_ccd_cores}{_e(other_ccd_cores)}")
     print(f"  Loading order   : {ordered_bw_cores}")
     print(f"  Max BW threads  : {max_bw_threads}")
+    if topo.get("group_source") == "heuristic":
+        print("  WARNING: core layout GUESSED (the OS topology could not be read); "
+              "CCD grouping and SMT siblings may be wrong.")
 
     # ── Build latency chase buffer ──
     print(f"\n  Building {latency_buf_mb} MB pointer-chase buffer...")
@@ -2681,13 +3012,10 @@ def run_loaded_latency_test(
             if in_same_ccd:
                 label = f"same-CCD core {bw_core}"
             else:
-                # Find which CCD
-                bw_ccd = "?"
-                for idx, g in enumerate(topo["ccd_groups"]):
-                    if bw_core in g:
-                        bw_ccd = str(idx)
-                        break
+                bw_ccd = plan["group_of"].get(bw_core, "?")
                 label = f"other-CCD({bw_ccd}) core {bw_core}"
+            if bw_core in e_core_set:
+                label += " (E-core)"
 
             # Spawn bandwidth worker
             worker = _BandwidthWorkerMP(array_mb=bw_buf_mb, core_id=bw_core)
@@ -2806,8 +3134,12 @@ def run_loaded_latency_test(
             "vendor": vendor,
             "n_physical": n_phys,
             "ccd_groups": topo["ccd_groups"],
+            "group_source": topo.get("group_source"),           # 6.98.2
+            "e_cores": sorted(e_core_set),                      # 6.98.2
             "latency_core": latency_core,
+            "latency_group": lat_ccd_idx,                       # 6.98.2
             "bw_core_order": ordered_bw_cores,
+            "os_topology": topology_summary(),                  # 6.98.2
         },
         "config": {
             "latency_buf_mb": latency_buf_mb,
@@ -2917,7 +3249,7 @@ def _plot_loaded_latency(data: Dict, output_dir: str, ts: str) -> None:
     if len(ccd_groups) > 1:
         same_ccd_count = len([c for c in topo.get("bw_core_order", [])
                               if any(c in g for i, g in enumerate(ccd_groups)
-                                     if i == 0)])
+                                     if i == topo.get("latency_group", 0))])
         if 0 < same_ccd_count < len(n_threads) - 1:
             ax1.axvline(same_ccd_count, color="#ffaa00", ls=":", lw=1.5, alpha=0.7)
             ax1.text(same_ccd_count + 0.1, max(latencies) * 0.9,
@@ -3259,6 +3591,7 @@ tr:hover td {{ background:#16213e; }}
     <div class="config-item">
         <div class="label">Topology</div>
         <div class="value">{len(ccd_groups)} CCD(s) — {[len(g) for g in ccd_groups]} cores each</div>
+        <div style="color:#888;font-size:0.8em">{topology.get('group_source') or 'source not recorded (pre-6.98.2 file)'}</div>
     </div>
     <div class="config-item">
         <div class="label">BW Worker Order</div>
@@ -3708,12 +4041,14 @@ class MemLatPro:
         print(f"\n  CPU   : {self.cpu_info['model']}")
         print(f"  Gen   : {gen}  |  Hybrid: {hybrid}")
         print(f"  Freq  : {freq_str} detected  |  measured {clk_str}")
+        print(f"  Topo  : {topology_line()}")
         print(f"  Pin   : {self.pin_mode}  |  SMT: {smt_str}"
               + (f"  |  THP: {thp}" if thp else f"  |  Pages: {self.mem_ctx['base_page_kb']} KB"))
         print(f"  L1/L2 : {self.cfg.get('l1_p_kb')} KB / {self.cfg.get('l2_p_kb')} KB (P-core)")
         if hybrid and self.cfg.get("l1_e_kb"):
             print(f"  L1/L2E: {self.cfg['l1_e_kb']} KB / {self.cfg['l2_e_kb']} KB (E-core cluster)")
-        print(f"  L3    : {self.cfg.get('l3_mb')} MB")
+        print(f"  L3    : {self.cfg.get('l3_mb')} MB"
+              + (f"  (per L3 group: {self.cfg['l3_mb_by_group']} MB)" if self.cfg.get("l3_mb_by_group") else ""))
         _src = self.cfg.get("cache_source", "table")
         _tc = self.cfg.get("table_cache")
         print(f"  Cache : sizes from {_src}"
@@ -4140,6 +4475,7 @@ class MemLatPro:
                     "cpus_seen": cpus,   # CPU at the start of each size (per-size: results[i].cpu)
                 },
                 "smt": self.smt,
+                "topology": topology_summary(),          # 6.98.2: from the OS
                 "pages": dict(self.mem_ctx,
                               hugepage_coverage_pct_by_pattern=coverage,
                               per_buffer="results[i][pattern].hugepage_coverage_pct"),
@@ -4569,6 +4905,10 @@ def generate_html_report(payload: Dict, html_path: str) -> None:
                 (f"Measured clock: {_clk:.2f} GHz"
                  + (" (approx., unpinned)" if (rc.get('clock') or {}).get('approximate') else "")
                  if _clk else "Measured clock: n/a")]
+    _tp = rc.get("topology") or {}
+    if _tp.get("available", True) and _tp.get("n_physical"):
+        ctx_bits.insert(0, f"Topology: {_tp['n_physical']}C/{_tp.get('n_logical')}T, "
+                           f"{len(_tp.get('l3_groups') or [])} L3 group(s) ({_tp.get('source')})")
     ctx_line = " | ".join(ctx_bits) if rc else "Run context not recorded (pre-6.96 file)"
     # Which sizes fed the headline numbers (6.96 plateau windows)
     _wins = summary.get("windows") or {}
@@ -7065,6 +7405,87 @@ def run_hugepage_check(sizes_mb=HUGEPAGE_CHECK_SIZES_MB) -> int:
     return rc
 
 
+def run_topology_check(topo: Optional[Dict] = None) -> int:
+    """
+    (6.98.2) --topology: what the OS reports, and where each test would run.
+    NumPy + psutil only (no Numba). Compare the first block with another tool
+    (bbmst, HWiNFO, Task Manager): cores, threads, L3 groups and cache sizes
+    must agree. Returns 0 when the topology came from the OS, else 1.
+    """
+    topo = topo or detect_topology()
+    bits = ctypes.sizeof(ctypes.c_void_p) * 8
+    print("=" * 72)
+    print(f"  MemLat Pro v{VERSION} -- CPU topology check")
+    print("=" * 72)
+    print(f"  Platform : {platform.platform()}  (Python {platform.python_version()}, {bits}-bit)")
+    if not topo.get("available"):
+        print(f"\n  The OS topology could not be read: {topo.get('error')}")
+        print("  MemLat falls back to guessing (\"even logical CPUs are cores, 8 per CCD\").")
+        print("=" * 72)
+        return 1
+
+    def kb(x: Optional[int]) -> str:
+        if not x:
+            return "?"
+        return f"{x // 1024} MB" if x >= 1024 and x % 1024 == 0 else f"{x} KB"
+
+    print(f"  Source   : {topo['source']}")
+    print(f"  Summary  : {topology_line(topo)}")
+    print(f"  Logical CPUs  : {topo['n_logical']}   Physical cores: {topo['n_physical']}   "
+          f"SMT: {'on' if topo['smt_active'] else 'off'}")
+    if topo["hybrid"]:
+        print(f"  Hybrid        : efficiency classes {topo['efficiency_classes']}  "
+              f"P-cores {topo['p_cores']}  E-cores {topo['e_cores']}")
+    else:
+        print(f"  Hybrid        : no (one efficiency class: {topo['efficiency_classes']})")
+    print(f"  Primary threads (pin targets): {' '.join(str(c) for c in topo['physical_cores'])}")
+    for i, (g, sz) in enumerate(zip(topo["l3_groups"], topo["l3_group_sizes_kb"])):
+        print(f"  L3 group {i} ({kb(sz)}): {len(g)} cores {g}")
+    c = topo["caches"]
+    print(f"  Caches, reference core {c.get('cpu')}: L1d {kb(c.get('l1d_kb'))} / "
+          f"L2 {kb(c.get('l2_kb'))} / L3 {kb(c.get('l3_kb'))}")
+    ce = topo.get("caches_e") or {}
+    if ce:
+        print(f"  Caches, E-core {ce.get('cpu')}        : L1d {kb(ce.get('l1d_kb'))} / "
+              f"L2 {kb(ce.get('l2_kb'))} (shared by {ce.get('l2_shared_by_cores')} cores) / "
+              f"L3 {kb(ce.get('l3_kb'))}")
+    print("\n  Core  threads        class  L1d      L2       L3       L3 group")
+    for core in topo["cores"]:
+        thr = ",".join(str(t) for t in core["threads"])
+        print(f"  {core['cpu']:>4}  {thr:<14} {core['efficiency_class']:>5}  "
+              f"{kb(core['l1d_kb']):<8} {kb(core['l2_kb']):<8} {kb(core['l3_kb']):<8} "
+              f"{core['l3_group']}")
+    for n in topo.get("notes") or []:
+        print(f"  Note: {n}")
+
+    # Where the tests would run, through the same functions the tests use
+    print("\n  Where MemLat would run (same code paths as the tests):")
+    cpu_info = detect_cpu()
+    cfg = get_cache_config(cpu_info)
+    tc = cfg.get("table_cache")
+    print(f"    Cache config  : L1 {cfg.get('l1_p_kb')} KB / L2 {cfg.get('l2_p_kb')} KB / "
+          f"L3 {cfg.get('l3_mb')} MB  from {cfg.get('cache_source')}"
+          + (f"  (CPU table had {tc['l1_p_kb']} / {tc['l2_p_kb']} KB / {tc['l3_mb']} MB)" if tc else
+             "  (matches the CPU table)" if cpu_info.get("gen_key") else "  (CPU not in the table)"))
+    print(f"    --core P / E  : {(cpu_info.get('p_cores') or ['-'])[0]} / "
+          f"{(cpu_info.get('e_cores') or ['none'])[0]}")
+    ct = _detect_core_topology()
+    plan = loaded_latency_plan(ct)
+    print(f"    Loaded latency: latency core {plan['latency_core']} (CCD {plan['latency_group']}), "
+          f"groups from {ct.get('group_source')}")
+    print(f"                    Same-CCD BW  {plan['same_group']}")
+    print(f"                    Other-CCD BW {plan['other_groups']}")
+    print(f"                    Loading order {plan['order']}")
+    for p in _rfo_core_pairs():
+        print(f"    RFO pair      : A={p['core_a']} B={p['core_b']}  {p['label']}  "
+              f"(shares L3: {p['shares_l3']})")
+    smt = detect_smt_state()
+    print(f"    SMT state     : active={smt.get('smt_active')}  physical={smt.get('physical_cores')}  "
+          f"logical={smt.get('logical_cpus')}")
+    print("=" * 72)
+    return 0
+
+
 def _run_loaded_latency_guarded(**kwargs) -> None:
     """(6.98) A failure inside the loaded latency test is reported, not left
     to close the console window with an unread traceback."""
@@ -7102,7 +7523,16 @@ def main() -> None:
     parser.add_argument("--hugepage-check", action="store_true",
                         help="Large-page diagnosis only: elevation, privilege, "
                              "GetLargePageMinimum, 64 MB and 2 GB test allocations")
+    parser.add_argument("--topology", action="store_true",
+                        help="Print the CPU topology and cache sizes the OS reports, and "
+                             "which cores each test would use, then exit")
     args = parser.parse_args()
+
+    # ── Topology check (6.98.2); needs NumPy + psutil only ──
+    if args.topology:
+        rc = run_topology_check()
+        _pause()
+        sys.exit(rc)
 
     # ── Large-page diagnosis (6.98.1); needs NumPy only ──
     if args.hugepage_check:
